@@ -1,2 +1,9 @@
 # docker-and-kubernetes
-Docker and Kubernetes: The Complete Guide (Code from the Udemy Course by Stephen Grider)
+
+My notes and code snippets from the Udemy Course:
+
+[Docker and Kubernetes: The Complete Guide](https://www.udemy.com/course/docker-and-kubernetes-the-complete-guide) 
+
+(by: Stephen Grider)
+
+
