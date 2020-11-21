@@ -205,29 +205,408 @@ docker build -t thomasmarkiewicz/redis:latest .
 docker run thomasmarkiewicz/redis:latest
 ```
 
-The convension for the `tag` is:
+The convention for the `tag` is:
 
 `<your docker id>/<project name>:<version>`
 
+The `:<version>` is really the tag.  If you don't explicitly specify it it defaults to `:latest`
+
+One last interesting thing: it is possible to manually create an image out of a running container that you have setup/configured manually. It's not a good practice to do that, so don't, but it's interesting to know that you can:
+```
+docker commit -c 'CMD ["redis-server"]' <container id> <tag>
+```
+
+`'CMD ["redis-server"]'` is the image startup command you want to use.
 
 
 ### Making Real Projects with Docker
 
+See code here: `./Course/04 - Making Real Projects with Docker/simpleweb`
+
+`alpine` starting image doesn't include node etc.
+
+`node` image also exists and already includes node and npm. It has several different tags, including `alpine` = as small as compact as possible. To use that particular image add this to Dockerfile:
+
+```
+FROM node:alpine
+```
+
+
+It seems that it's important to set the image WORKDIR right upfront for stuff to work these days.  This sets the default image directory () that commands assume when copying files etc.  In this case we're saying our app will live in `/usr/app` directory:
+```
+WORKDIR /usr/app
+```
+
+DISCREPANCY:
+
+In the course lesson 44 Stephen lectures about missing package.json when building an image from the Dockerfile.  He shows docker throwing an error.  I don't see that error - docker build succeeds.
+
+But the problem is still there.  I didn't get an error but examining the /usr/app directory in the image shows that package.json file IS there, but it's EMPTY!  It's not the same package.json file that is on my local filesystem! So I still need the step to copy it to the image.
+
+To do that, COPY files from the `build context` to inside of the container.
+- The first argument `./` is the path to folder to copy from on *your machine* relative to the `build context` (specified on `docker build <context>`)
+- The second argument `./` is a place to copy stuff to inside *the container*
+```
+COPY ./ ./
+```
+
+So now `docker run` starts the container successfully, and starts running `node index.js` (the startup command) successfully.  We see a console log informing that it's "Listening on port 8080", BUT when pointing our local web browser to it, it doesn't work.
+
+---
+
+SIDE NOTE: 
+
+On Windows Home with Docker Toolbox, you can't point your browser to `localhost:8080`.  That doesn't work apparently.  You need to figure out the actual IP address of the `docker-machine`.  To do that:
+```
+docker-machine ip
+```
+
+I believe this is a Windows Home only issue though.  I don't even have `docker-machine` command on my Manjaro Linux.
+---
+
+The running container has it's own ISOLATED ports that can receive traffic, but by default they are not connected. We have to setup an explicit *port mapping*.  It's very similar to port-forwarding on a home router.
+
+NOTE that this limitation is ONLY for *incoming* requests.  The container *CAN* by default make any requests from the inside to the outside word!
+
+To open up the ports, we do not change the Dockerfile.  Instead we need to provide extra arguments when *starting* the container up, the `-p INCOMING_LOCAL_HOST_PORT:PORT_INSIDE_CONTAINER`. For example, to forward port 8080 from our local machine network to port 8080 of the container, you would start the container like so
+```
+docker run -p 8080:8080 <image id>
+```
+
+Finally, now pointing your local browser to `localhost:8080` hits the server running inside the container.
+
+NOTE that the local machine port and container ports DO NOT have to be identical. So you could do the following and point your local browser to `localhost:5000` instead.
+```
+docker run -p 5000:8080 <image id>
+```
+
+NEXT PROBLEM is with local development workflow.  We have the container started and can hit the server with the local web browser.  However, when we make a change to the server code (index.js) and save, the browser doesn't see that change!
+
+This is because we take a one-time *snapshot* of our files when creating the image, with the COPY command, and the container doesn't automagically update when we make a change to our local filesystem.
+
+There is a way to accomplish that with a configuration, but that will be covered in the sub-sequent section.  For now, you must rebuild your container after every local change.
+
+There is a small problem with this approach though: everything after the COPY command in the Dockerfile must be rebuild from scratch because it changed and invalidated the image cache for the following commands.  This is inefficient.  
+
+More specifically it has to `RUN npm install` and re-install ALL the dependencies from scratch even though we didn't change them - only changed the index.js file.  This could be a lengthy process! It's not ideal.
+
+To fix that, we can split the COPY command in the Dockerfile into two separate steps.
+
+Note that `RUN npm install` cares ONLY about the package.json file - it doesn't need the rest of the files.  So we can first just copy that file before, than execute the RUN command, and finally copy the rest of the files afterwards:
+```
+COPY ./package.json ./
+RUN npm install
+COPY ./ ./
+```
+
+This moves the image cache invalidation AFTER `RUN npm install` which is expensive to invalidate.  The image cache still gets invalidated, but afterwards and is not that bad anymore.  But if we make a change to package.json at that point it will still invalidate and re-install all packages.
+
+The lesson here is to pay attention to the log output of `docker build` and look out for "Using cache".  Then maybe re-arranging the Dockerfile COMMANDS to optimize the image caching.
+
+It's also a good idea to COPY the *bare minimum* for each successive step.
+
 ### Docker Compose with Multiple Local Containers
 
+We're building here a new project that will consist of two containers:
+1. A web app that displays some data
+2. Redis
+
+They are put in separate containers so that we can keep a SINGLE instance of Redis, but multiple web app containers to scale as necessary, each connecting to the same instance of Redis.
+
+The code for this project lives at: `./Course/05 - Docker Compose with Multiple Local Containers`
+
+When the node app first starts up, it is trying to connect to the Redis server.  But each, the node app and the Redis server, run in their own isolated containers and cannot by default talk to each other.
+
+We have two options:
+- use `docker` CLI to setup a network between the containers
+- use `docker-compose`
+
+Setting up the network with `docker` is a real pain to do.
+It involves running a handful of commands each time we start up.
+It could be scripted, but no one ever goes with this approach.
+
+Using `docker-compose` is much easier.  
+It's a separate CLI (that gets installed with `docker` so you should already have it?)
+
+Advantages:
+
+- `docker-compose` really exists to prevent you from writing a lot of separate commands with the docker CLI and providing all the details as program arguments (specifying ports, etc)
+
+- used to start up multiple Docker containers at the same time with some form of networking
+
+- automates some of the long-winded arguments we were passing to `docker run`
+
+
+To make use of docker-compose, we essentially take the same commands we were running before with the `docker` CLI, but we're going to encode these commands in a configuration file:
+
+`docker-compose.yml`
+
+That file instructs how to create one or more docker containers.
+Each container can be build from either:
+- an image (including those stored in Docker Hub)
+- a Dockerfile on your machine
+
+In addition, it has a section for mapping network ports.
+
+In docker-compose terminology, `services` word essentially boils down to meaning a `container`. It's more like a *type* of container. In the yml file we setup `services` to be docker `containers`.
+
+Here is an example for the project we're working with:
+```
+version: '3'
+services:
+  redis-server:
+    image: 'redis'
+  node-app:
+    build: .
+    ports:
+      - "4001:8081"
+```
+
+Notice that we didn't have to configure a "network".  Just by specifying those two "services" in the same yml file, `docker-compose` is going to automatically create both of these containers on essentially the same network and they can thus communicate with each other in any way that they please.  Basically they share the ports on the same network.
+
+All containers within that same network can communicate with each other and we don't have to do any additional configuration to make that happen.
+We ONLY have to punch in `port` holes to services that we want to make incoming requests to from *OUTSIDE* of that virtual network they live in. The node app for example.
+
+But how does one service address servers running in another container? Typically outside of `docker-compose` world the host would be some sort of URL with an IP address or domain name.  Services in the `docker-compose` world however MUST address each other by the *name* assigned to them in the `docker-compose.yml` file.
+
+For example, when specifying a `host` configuration for the redis server, instead of:
+
+`host: 'https://my-redis-server.com'`
+
+we must use the name of the service that is running redis, in our case:
+
+`host: 'redis-server'`
+
+node.js, express, etc. have no idea what 'redis-server' means.  Redis just takes it and assumes it will work as any other URL. Docker performs the translation magic when it sees Redis attempting to connect to 'redis-server' and forwards it to the appropriate service at runtime.
+
+Once we have the `docker-compose.yml` configured, to start the containers specified:
+```
+docker-compose up
+```
+
+The above doesn't automatically re-build from Dockerfile however. To do that we need an addition `--build` argument:
+```
+docker-compose up --build
+```
+
+`docker-compose` looks for `docker-compose.yml` file in the current directory.
+
+
+
+How to deal with containers that crash or hang?
+
+- restart it automatically
+
+To do that, we can specify a "Restart Policy" inside of our `docker-compose.yml` file. There are four different policies we can use:
+
+- no
+- always
+- on-failure
+- unless-stopped
+
+For example,
+
+```
+services:
+  node-app:
+    restart: always
+```
+
 ### Creating a Production-Grade Workflow
+[skipped]
 
 ### Continuous Integration and Deployment with AWS
+[skipped]
 
 ### Building a Multi-Container Application
+[skipped]
 
 ### "Dockerizing" Multiple Services
+[skipped]
 
 ### A Continuous Integration Workflow for Multiple Images
+[skipped]
 
 ### Multi-Container Deployments to AWS
+[skipped]
 
 ### Onwards to Kubernetes!
+
+A `Cluster` in a world of Kubernetes is an assembly of:
+- a `master` that controls what each `node` does
+- and one or more `node`s
+
+A `Node` is a Virtual Machine OR a physical computer that runs some number of `container`s
+
+A `Master` controls what each `Node` is running at any given time.
+
+Developers interact with the Kubernetes `Cluster` by reaching out to the `Master`.  We give `Master` some set of directions for example: "hey, please run five containers using the 'client worker' image". `Master` takes those directions and relays them to the `Nodes`.
+
+`Load Balancer` lives outside of the `Cluster`. It relayes outside network requests to the `Node`s
+
+Kubernetes is a system for:
+
+- running many different containers
+- different types of containers
+- different number of containers
+- over several different computers or VMs
+- good for scaling up our application with different containers and quantities independently
+
+
+Working with Kubernates:
+
+- Development
+   - `minikube`
+
+- Production (managed solutions)
+   - Azure (AKS)
+   - Amazon (EKS)
+   - Google (GKE)
+   - Digital Ocean
+   - Do it yourself
+
+`minikube` is a command line tool used to:
+
+  - setup a Kubernetes `cluster` on your local machine
+  - managing the Node itself (Node = VM)
+  - it creates one `Node` that runs the `Container`s
+
+`kubectl` is another command line tool used to:
+
+  - interact with the `Cluster` in general
+  - manage the the `Node`s and `Container`s
+  - used for both `minikube` as well as production solutions
+
+Kubernetes expects all the images to be already built.  There is no option to have Kubernetes build it for us as `docker-compose` could.  The images must be build during some outside step.
+
+Kubernetes uses *multiple* configuration files. Unlike `docker-compose` where each service was a `container`, with Kubernetes we have one configuration file to define an `object`.
+
+And `object` is not necessarily going to be a `container`. 
+
+In Kubernetes, we have to manually setup a vast majority of our networking, including internal networking between `objects`.  It is a far more involved process vs `docker-compose`. [Networking setup is done is a separate config file???]
+
+Since I've skipped building the multi-client in the lectures above, I'm using Stephen's image instead in the lecture:
+
+image: stephengrider/multi-client
+
+In this section we're creating two configuration files that define two different `kind`s, or types, of `object`s:
+```
+kind Pod
+kind Service
+```
+
+We will feed those configuration files to `kubectl` tool to configure our `minikube` `cluster`.  It will create two `object`s one for each file.
+
+An `object` is a *thing* that exists inside out Kubernetes cluster.
+- Pod
+- Service
+- StatefulSet
+- ReplicaController
+
+The `apiVersion` specified in the configuration file defines a different set of `object`s we can use in that file.
+
+`apiVersion: v1`
+- componentStatus
+- configMap
+- Endpoints
+- Event
+- Namespace
+- Pod
+- Service
+- [more...]
+
+`apiVersion: apps/v1`
+- ControllerRevision
+- StatefulSet
+- [more...]
+
+
+A `Pod` is used to run a `container`.
+`Node` > `Pod` > `Container`
+
+A `Pod` is a *grouping* of `container`s with a very common purpose. Its a group of containers that MUST be deployed together or they won't work otherwise.  Typically we will just run one `container`.
+
+In Kubernetes world there is no such thing as "just creating a container" on a `cluster`.  
+It must be in a `Pod`. 
+A `Pod` is the *smallest* thing you can deploy to run a single `container`.
+A `Pod` *must* run one or more `container`s inside of it. 
+
+
+
+A `Service` is used to setup networking.
+There are four sub-types:
+- ClusterIP
+- NodePort
+- LoadBalancer
+- Ingress
+
+The way this is specified in a configuration file:
+```
+apiVersion: v1
+kind: Service
+spec:
+  type: NodePort
+```
+
+The purpose of a `NodePort` `Service` is to expose a `Container` to the outside world. To allow you as a developer to open up your web browser to access that container. It is *ONLY* good for development purposes. It is not used in production environments. 
+
+QUESTION: should I have two different sets of k8s cofig files for `dev` and `prod`?
+
+Every single Node/VM has a single `kube-proxy`.  It is Node/VM's one, only, single window to the outside world.  Every incoming request first flows through this `kube-proxy`.  It inspects the request and decides how to route it inside the Node.  It routes it to a `Service` which in turn has port mapping to some `Container`. 
+
+`Service` of subtype `NodePort` uses a `selector` section to specify which `object`s to route the request to. 
+
+Instead of using `object` or `Pod` names for this, it uses `labels`.  You first apply some arbitrary label name on your component, and than use that same label name in the `selector` section of the configuration file.
+
+In the `Pod` config file, the Pod is labeled in the `metadata` section:
+```
+apiVersion: v1
+kind: Pod
+metadata:
+  labels:
+    component: web
+```
+
+`component: web` is a `key: value` definition. So you can for example apply the `component` key with different `value` on different `container`s 
+
+`NodePort` `Service` defines three different kinds of ports:
+- port - a port that another Pod *inside* our cluster can use to connect to the Pod we're defining
+- targetPort - a port inside our Pod that we want to open up the traffic to
+- nodePort - is what the web browser would use (30000-32767)
+
+
+How to point your browser to a container running in your cluster?
+
+First we need to find out the IP address of the cluster, even when using minikube locally.  The Node/VM it created has its own IP address.  To find out what it is:
+```
+minikube ip
+```
+
+That's the IP address you must use.  There is also the `nodePort` that has been configured that must also be appended. You can get that from your configuration file, or run
+```
+kubectl get services
+```
+
+and look for the port in the PORT(S) column - it's the second one after the colon. (31515 in this case).
+
+Something to notice, when we start `minikube` we end up with a Node/VM which is running another copy of Docker - separate from you local machine's Docker.  Stephen somehow seems to interact from his machine with the Docker running inside Kubernetes cluster but hasn't explained yet how to do that.  Reason I say that is because when I do `docker ps --all` I *don't* see the containers running in the `cluster` as he is showing.
+
+Other important takeaways:
+
+- Kubernetes is a system to deploy containerized apps
+- `Nodes` are individual machines (or VMs) that run Docker containers (in Pods)
+- `Masters` are machines (or VMs) with a set of programs to manage `Nodes`
+- Kubernetes doesn't build our images - it gets them from somewhere else (hub)
+- `Master` decides *where* (which `Node`) to run each container - each `Node` can run a dissimilar set of containers (although we DO have the ability to control it via config files if we want to)
+- To deploy something, we update the desired state of the `Master` with a config file
+- The `Master` works *constantly* to meet your desired state (ie. restarts crashed containers)
+
+
+Discussion about two different ways of approaching deployments:
+
+- Imperative Deployments: "do exactly these steps to arrive at this container setup"
+- Declarative Deployments: "our container setup should look like this, make it happen"
+
 
 ### Maintaining Sets of Containers with Deployments
 
@@ -281,6 +660,14 @@ Create and run a container from an image
 docker run <image name>
 ```
 
+Create and run a container from an image with port forwarding (`-p`)
+```
+docker run -p INCOMING_LOCAL_HOST_PORT:PORT_INSIDE_CONTAINER <image name>
+docker run -p 8080:8080 <image name|id>
+```
+
+
+
 Create and run a container from an image booting straight into `sh` *instead of* executing the default startup program:
 ```
 docker run -it <image name> sh
@@ -328,9 +715,174 @@ Tag an image when building it:
 docker build -t thomasmarkiewicz/redis:latest .
 ```
 
+Create an image out of a running container 
+that you maybe setup manually via sh
+(don't use this very often - just interesting):
+```
+docker commit -c 'CMD ["redis-server"]' <container id>
+```
+
+### Dockerfile INSTRUCTIONS
+
+Base your image on some previously defined image
+```
+FROM <image name>:tag
+```  
+
+Set a working directory. Any following command will be executed relative to this path in the container. This prevents copying files to the root `/` for example and copies them to the specified work directory:
+```
+WORKDIR /usr/app
+```
+
+Download and install a dependency
+```
+RUN apk add --update redis
+```
+
+Tell the image what to do when it starts as a container
+```
+CMD ["redis-server"]
+```
+
+Copy files from `build context` to inside of the container.
+- The first argument `./` is the path to folder to copy from on *your machine* relative to the `build context` (specified on `docker build <context>`)
+- The second argument `./` is a place to copy stuff to inside *the container*
+```
+COPY ./ ./
+```
+
+### Docker Compose CLI examples
+
+The very special configuration file
+```
+docker-compose.yml
+```
+
+Specify the version
+```
+version: '3'
+```
+
+Specify services (aka containers)
+```
+services: 
+```
+
+Specify that we want a `redis-server` container build from the `redis` image
+```
+services:
+  redis-server:
+    image: 'redis'
+```
+
+Specify that we want a `node-app` container build from a Dockerfile in the local directory
+```
+services:
+  node-app:
+    build: .
+```
+
+Specify port mapping.  Same convention as in `docker` CLI: first is the local machine port : second is the port of the container
+```
+services:
+  node-app:
+    build: .
+    ports:
+      - "4001:8081"
+```
+
+To specify a restart policy (one of: `no`, `always`, `on-failure`, `unless-stopped`)
+```
+services:
+  node-app:
+    restart: always
+```
+
+
+
+Once we have the `docker-compose.yml` configured, to start the containers specified in that file, `cd` to where `docker-compose.yml` is defined and:
+```
+docker-compose up
+```
+
+The above doesn't automatically re-build from Dockerfile however. To do that we need an additional `--build` argument:
+```
+docker-compose up --build
+```
+
+To launch all the containers in the *background* add `-d` flag
+```
+docker-compose up -d
+```
+
+To stop all the containers:
+```
+docker-compose down
+```
+
+Show status of running containers:
+```
+docker-compose ps
+```
 
 ### Kubernetes CLI examples
+
+Start local Kubernetes cluster
+```
+minikube start
+```
+
+Stop local Kubernetes cluster
+```
+minikube stop
+```
+
+Check minikube status
+```
+minikube status
+```
+
+Get info about your cluster
+```
+kubectl cluster-info
+```
+
+Feed a config file to `kubectl`
+```
+kubectl apply -f <filename>
+```
+
+Print out the status of the `object`s in a `cluster`
+(to make sure they were successfully created for example)
+```
+kubectl get pods
+kubectl get services
+```
+
+When running minikube cluster in development, you must use its Node/VM IP address to access its containers.  To find out what that IP address is:
+```
+minikube ip
+```
 
 ### Kubernetes on AZURE
 
 ### Kubernetes on Digital Ocean
+
+## Q & A
+
+### What is an *unnamed docker volume* ?
+
+
+### What is a *named docker volume* ?
+
+Example of running `nextcloud` container with a *named docker volume* `nextcloud` (where -v nextcloud: is a directory on your host?)
+```
+docker run -d -v nextcloud:/var/www/html nextcloud
+```
+
+Example of running a `postgresql` container with a *named docker volume* `db` that holds PostgreSQL Data (where -v db: is a directory on your host?)
+```
+docker run -d -v db:/var/lib/postgresql/data postgres
+```
+
+### What is a *mounted host directory* ?
