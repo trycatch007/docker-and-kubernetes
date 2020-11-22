@@ -107,7 +107,7 @@ docker kill <container id>
 
 At some point you will probably want to delete all of the `Exited` containers on your machine to free up some space.  This is the command, but also note that it will delete few other things including the cached images you have already downloaded (so next time you will need to re-download - not a big deal).
 ```
-docker system prune
+docker system prune -a
 ```
 
 #### Multi-Command Containers
@@ -610,6 +610,130 @@ Discussion about two different ways of approaching deployments:
 
 ### Maintaining Sets of Containers with Deployments
 
+Our new goal for this section is to update previously deployed Pod with `multi-client` image to use the `multi-worker` image instead.  The idea is to learn how to do that *declaratively* via the config files.
+
+`Master` uses the `name` and `kind` values from the configuration file to figure out which `object` to update.  You can change all other values in the file, but not those two, otherwise you're basically creating a new `object`.
+
+How can we inspect a `Pod` to verify which containers it is running? To verify that it is running our new image? We need to get detailed information about our Pod.
+
+To get detailed information about an `object` inside of our `cluster`:
+```
+kubectl describe <object type> <object name>
+kubectl describe pod client-pod
+```
+
+I verified with this command that indeed the `container` running in our `Pod` is running and using the new image.
+
+Next we try to change the value of the containerPort, say to 9999 and `cubectl apply` it again. BUT THAT FAILS! kubectl spits out an error message instead with some info about *which* properties can be updated and apparently containerPort is not one of them.
+
+This is a limitation of a `Pod` kind.  We can use another `object` kind if we want to be able to change *any* of the config values: `Deployment`
+
+A `Deployment` is a Kubernetes `object` that is meant to maintain a *set* of *identical* `Pods` ensuring that they have the correct config and that the right number exists.  It ensures the the `Pods` are running the correct configuration, and is always in a runnable state.
+
+It really is very similar in nature as `Pod` in practice. We can use either `Pods` or `Deployments` to run `containers`, however `Pods` are really only used during development and rarely in production.  A `Deployment` is good for both dev and prod.  It allows changing all of the Pod configuration.
+
+In reality, we just used `Pods` to learn about them, and instead use `Deployment`s from now on.
+
+A `Deployment` object has attached to it a `Pod Template` used to create the `Pod`s. Any config changes we actually make, change this `Pod Template`, not the `Pod` configuration itself.  `Deployment` will than either update the `Pod` configuration if it can, or kill and spin up a new one with updated configuration.  It constantly watches the Pods, their state, configuration, and restarts them when they crash.
+
+The `Deployment` is actually talking to the `Master` to coordinate creation of `Pods`.
+
+Each `Pod` gets its own internal IP address assigned to it in a `cluster`.
+It can change however every time it restarts, updates, etc.
+To find out what that IP address is:
+```
+kubectl get pods -o wide
+```
+
+A `Service` doesn't route incoming requests using `Pod`'s IP address however.  Instead it uses the `selector` specified in the configuration file.  So even though `Pods` IP address changes it can still find it.
+
+My own observation: a `Service` still routes to a `Pod` even if that `Pod` is created via a `Deployment`.
+
+So now we deleted the old Pod with:
+```
+kubectl delete -f <config-file>
+```
+
+We created a `Deployment` with a template for `Pods` and applied that instead.
+
+We can finally change the `containerPort` now in the `Deployment` file.  It works! But we can see that column `AGE` in `kubectl get pods` shows *seconds*.  What this means is that the `Deployment` deleted the old container and re-created a new one with the updated IP address.
+
+To verify that the container is running with the new port:
+```
+kubectl get pods
+```
+
+Note the name of the pod from above and:
+```
+kubectl describe pods client-deployment-cb665f48d-qsl5w
+```
+
+Look for "Port:" in the output.
+
+When we change the `replicas` in a `Deployment` configuration file, it will create multiple copies of the `Pod`.  Each one with a different IP address, but exposing the same port.
+
+We were also able to update the `Deployment` to a new `image` name and see that succeed.
+
+But how do we re-create our `Pod`s with the new version of the same image?
+Surprisingly that is very challenging.  There is not a very good solution around it.
+
+Why is this challenging?
+
+Because *nothing* changes in the `Deployment` file.  There is nothing in that file that versions the image.  Since `kubectl` doesn't see any changes it rejects the file with "unchanged" message.  It does not update the containers with a new image version from Docker Hub 
+
+Workarounds? (none are that good, but sort of work)
+
+- manually delete pods to get the deployment to recreate them with the latest version (but that seems silly and a bad idea)
+
+- tag build images with a real version number when building and specify that version in the config file (better).  It adds an extra step in the production deployment process, and is not really friendly - but it could work.  We are not allowed to use environment variables in Kubernetes config files so we would need some custom templating process. Also, building and tagging of the docker images would typically occur in some CI environment, but we would have to update and `git commit` k8s configs with the new version *afterwards* which is a big pain in the rear.
+
+- use an imperative command to update the image version the deployment should use after the image is built and tagged.  So when we build our image we still append a version number, but rather then updating our configuration files with new version, we issue a imperative command afterwards to update Kubernetes `Pods` in a cluster. (this is what Stephen in going with - it is pretty reasonable).
+
+To run a `kubectl` command forcing the deployment to use the new image version (imperative command to update an image):
+```
+kubectl set image <object_type>/<object name> <container_name> = <new image to use>
+kubectl set image deployment/client-deployment client=stephengrider/multi-client:v5
+```
+
+The building, version tagging of an image, and the imperative command to update the deployment will need to be automated/scripted in the CI. 
+
+Multiple docker installations:
+
+This goes back to hooking up into the Docker running in the minikube instead your local machine.
+
+There is a way to re-configure your local machine's `docker-client` (CLI) to point to the `docker-server` of the minikube `Node`/VM.  This is done on per-terminal basis.
+
+To configure your local copy of docker CLI to communicate with a copy of docker-server inside the Node/VM of minikube (temporary per terminal window only)
+```
+eval $(minikube -p minikube docker-env)
+```
+
+To see what this command is doing, you can run this by itself:
+```
+minikube docker-env
+```
+
+The output is:
+```
+export DOCKER_TLS_VERIFY="1"
+export DOCKER_HOST="tcp://192.168.49.2:2376"
+export DOCKER_CERT_PATH="/home/tom/.minikube/certs"
+export MINIKUBE_ACTIVE_DOCKERD="minikube"
+
+# To point your shell to minikube's docker-daemon, run:
+# eval $(minikube -p minikube docker-env)
+```
+
+It essentially just sets up some new envirnment variables.
+The DOCKER_HOST is the IP address of you minikube.
+
+Why would we want to do this? Why mess with Docker in the Node?
+
+- use all the same debugging techniques we learned with Docker CLI (but many of these commands are actually available through `kubectl`)
+- manually kill containers to test Kubernetes ability to 'self-heal'
+- delete cached images in the node
+
+
 ### A Multi-Container App with Kubernetes
 
 ### Handling Traffic with Ingress Controllers
@@ -666,8 +790,6 @@ docker run -p INCOMING_LOCAL_HOST_PORT:PORT_INSIDE_CONTAINER <image name>
 docker run -p 8080:8080 <image name|id>
 ```
 
-
-
 Create and run a container from an image booting straight into `sh` *instead of* executing the default startup program:
 ```
 docker run -it <image name> sh
@@ -692,6 +814,11 @@ docker stop <container id>
 Kill a container right away
 ```
 docker kill <container id>
+```
+
+Get output of the main running process from the point the container started:
+```
+docker logs <container id>
 ```
 
 Get shell/terminal access to your running container:
@@ -720,6 +847,16 @@ that you maybe setup manually via sh
 (don't use this very often - just interesting):
 ```
 docker commit -c 'CMD ["redis-server"]' <container id>
+```
+
+Push a docker image to Docker Hub:
+```
+docker push <image name>
+```
+
+To configure your local copy of docker CLI to communicate with a copy of docker-server inside the Node/VM of minikube
+```
+eval $(minikube docker-env)
 ```
 
 ### Dockerfile INSTRUCTIONS
@@ -847,6 +984,11 @@ Get info about your cluster
 kubectl cluster-info
 ```
 
+When running minikube cluster in development, you must use its Node/VM IP address to access its containers.  To find out what that IP address is:
+```
+minikube ip
+```
+
 Feed a config file to `kubectl`
 ```
 kubectl apply -f <filename>
@@ -856,12 +998,50 @@ Print out the status of the `object`s in a `cluster`
 (to make sure they were successfully created for example)
 ```
 kubectl get pods
+kubectl get deployments
 kubectl get services
 ```
 
-When running minikube cluster in development, you must use its Node/VM IP address to access its containers.  To find out what that IP address is:
+To get a little more information append `-o wide` to `kubectl get`.
+This is how you can find out the IP address assigned to a `Pod` for example:
 ```
-minikube ip
+kubectl get pods -o wide
+```
+
+To get detailed information about an `object` inside of our `cluster`:
+```
+kubectl describe <object type> <object name>
+kubectl describe pod client-pod
+```
+
+To delete/remove and existing object, use the original configuration file that was used to create it when running this command. Note that this is an *imperative* update!
+```
+kubectl delete -f <config file>
+```
+
+To run a `kubectl` command forcing the deployment to use the new image version (imperative command to update an image):
+```
+kubectl set image <object_type>/<object name> <container_name> = <new image to use>
+kubectl set image deployment/client-deployment client=stephengrider/multi-client:v5
+```
+
+Get output of the main running process from the point the container started:
+```
+kubectl get pods
+kubectl logs <pod name>
+```
+
+To shell into a container
+```
+kubectl get pods
+kubectl exec -it <pod name> sh
+```
+
+To removed all cached images in minikube Node/VM
+```
+minikube docker-env
+eval $(minikube -p minikube docker-env)
+docker system prune -a
 ```
 
 ### Kubernetes on AZURE
