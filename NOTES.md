@@ -906,6 +906,56 @@ All that's left now is punching a hole in the cluster to expose it to incoming r
 
 ### Handling Traffic with Ingress Controllers
 
+`LoadBalancer` `Service` is an old / legacy way to provide some networking inside your cluster.  People don't use it anymore.  Instead, use an `Ingress`.
+
+`Ingress` `Service` exposes a set of services to the outside world.
+
+In the world of Kubernetes there are several different **implementations** of an `Ingress`
+
+- Nginx Ingress (this is what this Course is using)
+  - `ingress-nginx` project
+  - a **community** led project (part of the official Kubernetes organization - full endorsement and backing by Kubernetes people)
+  - github.com/kubernetes/ingress-nginx
+
+- We are **NOT** using `kubernetes-ingress`
+  - nginx company led project
+  - github.com/nginxinc/kubernetes-ingress
+
+The **setup** of this service is going to be **different** depending on the environment that you are using it in:
+
+- local
+- GC
+- AWS
+- Azure
+
+In this project we set it up locally and on GC.
+
+A `Deployment` `object` is a type of `controller`. In Kubernetes a `controller` is any type of `object` that constantly works to make some desired state a reality inside of our cluster.
+
+An `Ingress` is also a type of `controller`.  When we feed our `Ingress Config` configuration file kubectl passes it on to something called an `Ingress Controller`.  It creates a desired infrastructure in this case.  In particular, a `Pod` running nginx that handles routing.
+
+Specifically for `ingress-nginx` project, the `Ingress Controller` and `thing that routes traffic` is the same thing (but in general they could be two separate things).
+
+On Google Cloud specifically, the way the request gets into the clusters is:
+1. Traffic
+2. Google Cloud Load Balancer (cloud native load balancer outside Kubernetes)
+3. Load Balancer Service (running inside your node Node)
+4. Deployment (that runs nginx-controller and nginx Pod)
+5. CusterIP Service of your Deployment target
+
+When we setup the `Ingress` service, it also deploys a ClusterIP+Deployment that runs a `default-backend` `Pod` - its checks the health of the cluster.  In an ideal world you would replace the `default-backend` with **your** express api server.  Meaning, ideally the request to check the health should go to **your** server implementation not a `default-backend`.
+
+Why not setup manually your own `LoadBalancer` `Service` with a custome `Nginx`? Because `ingress-nginx` does some extra Kubernetes specific things.  One example is, it bypasses ClusterIP Server for load balancing Pods in a Deployment and does that load balancing itself.  It does that to be able to support `sticky sessions` which are sometimes necessary when two requests from the same user MUST hit the same executable in the `Deployment`.
+
+A `Namespace` `object` can be created and names with a config file.  A `Namespace` is something that we can use to isolate different resources that we are creating inside our Kubernetes cluster.
+
+Q: What is the `/healthz` path about?
+
+To setup `ingress-nginx` for **standard usage** on local minikube (see: https://kubernetes.github.io/ingress-nginx/deploy/#minikube):
+```
+minikube addons enable ingress
+```
+
 ### Kubernetes Production Deployment
 
 ### HTTPS Setup with Kubernetes
@@ -1157,6 +1207,11 @@ When running minikube cluster in development, you must use its Node/VM IP addres
 minikube ip
 ```
 
+Delete your local cluster:
+```
+minikube delete
+```
+
 Feed a config file to `kubectl`
 ```
 kubectl apply -f <filename>
@@ -1246,6 +1301,20 @@ To examine secrets in your cluster:
 kubectl get secrets
 ```
 
+To setup `ingress-nginx` for **standard usage** on local minikube:
+```
+minikube addons enable ingress
+```
+Then follow up with applying a config file.
+
+To setup `ingress-nginx` in the cloud see:
+https://kubernetes.github.io/ingress-nginx/deploy/#minikube
+
+
+To see a dashboard of your cluster:
+```
+minikube dashboard
+```
 
 --- MY OWN ADDITIONS ---------------------------------
 
