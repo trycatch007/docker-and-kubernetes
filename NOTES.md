@@ -736,6 +736,174 @@ Why would we want to do this? Why mess with Docker in the Node?
 
 ### A Multi-Container App with Kubernetes
 
+Introducing a new kind of `Service` - a `ClusterIP`
+
+Recall that we use a `Service` any time we want to setup some kind of network for an object.
+
+A `NodePort` `Service` we used previously was used to "expose a set of pods to the outside world.  That is NOT something you want to do in production - it's for dev purposes only!
+
+A `ClusterIP` is more restricted form of networking.  It exposes a set of pods to **other objects in the cluster** but **NOT** to the outside world.
+
+We will later need to hook it up to another `Ingress` `Service` which does expose the cluster to the outside world.
+
+In the yaml file configuring `ClusterIP`:
+- `port` is the exposed port number that OTHER `objects` would use to connect to multi-client
+- `targetPort` is the port that multi-client is exposing and listening on for requests
+
+We created a bunch of `ClusterIP` and `Deployment` files first for each pod: client, server, worker, redis, postgres.
+
+**What is a PVC and why do we need it for postgres?**
+
+PVC = Persistent *Volume* Claim
+
+- postgres writes data to a `file system` (hard drive of sorts)
+- docker container has its own `file system` baked by the image
+- if that container restarts, it starts with fresh `file system` from the image loosing any data it saved
+- so we need something outside of the container where to save data
+- we need a `volume`
+
+- a `volume` can reside on a host machine (the machine that runs the docker engine) completely outside of the container/cluster
+
+- in this case when the container restarts, it re-points to the `volume` and thus has all the previous data
+
+
+`Volume` means two different things depending on the context:
+
+- in generic docker container terminology, it means some type of mechanism that allows a container to access a filesystem outside itself
+
+- in Kubernetes, it is an `object` that allows a container to store data at the `Pod` level
+
+As a matter of fact, Kubernates has three different kinds of volumes:
+
+- `Volume`
+- `Persistent Volume`
+- `Persistent Volume Claim`
+
+We don't want the first one, `Volume`, for data that needs to last. It's **not exactly** the same thing as Docker volume!!!
+
+For postgres we want either:
+
+- `Persistent Volume`
+- `Persistent Volume Claim`
+
+A `Volume` belongs to a `Pod` and can be accessed by any container running inside that Pod.  If the `container` restarts, it still gets access to the `Volume` in the `Pod`.  However, if the `Pod` itself ever dies - so does the `Volume` and all the data it holds!!!  So that is why we are not using a `Volume`.
+
+A `Persistent Volume` on the other hand creates some type of durable storage that is not tied to a specific `Container` OR a specific `Pod`.  It is outside of the `Pod`.  If `Pod` crashes and restarts, `Persistent Volume` sticks around and the new `Pod` can connect to it.  It has a lifecycle not connected to a `Pod`.
+
+A `Persistent Volume Claim` is an **advertizement** (like the Billboard). It is **NOT** and actual volume. It can't store anything, it's just an advertizement that says: "here are the different storage options that you have to store data inside your cluster".  We, the developers, write out this advertizement in a config file to inform the cluster what's available.
+
+Kubernetes than may have a bunch of `Statically provisioned Persistent Volume`s that are ready to go and hand out to that claim.  Those are something that we very specifically created ahead of time.  There is another option that could be created on the fly: `Dynamically provisioned Persistent Volume`.  It's not created ahead of time.  It's only create when you ask for it when creating the Pod.  Any of the Pods inside the cluster an choose from volumes advertized in the `Persistent Volume Claim`.
+
+A `PersistentVolumeClaim` has three different types of `access modes`:
+
+- `ReadWriteOnce` - can be used by a **single Node**
+- `ReadOnlyMany` - **multiple nodes** can **read** from this
+- `ReadWriteMany` = can be **read** and **written** to by **many** nodes
+
+Some options we may need to use in `Persistent Volume Claim` config file:
+
+```
+kubectl get storageclass
+```
+
+shows all the different options on your computer that Kubernetes has for creating a persistent volume.
+
+On a Cloud Provider, you may have a "billion" options available. Each provider is going to have their own options.  Google Cloud service has a "Persistent Disk", etc:
+
+- Google Cloud Persistent Disk
+- Azure File
+- Azure Disk
+- AWS Block Store
+- etc.
+
+You can see some of the other options here:
+
+https://kubernetes.io/docs/concepts/storage/storage-classes/
+
+So, inside the `Persistent Storage Volume` configuration file, it is possibly to explicitly specify `storageClassName` - but it's best in most cases to leave it out and let Kubernetes use the default that the Cloud provider has.
+
+For minikube, the default is to create a slice of your hard-drive for the persistent volume. In the cloud it will be something else - whatever the default is.
+
+Q: how would I GROW this volumes if needed for my database?
+Q: how can I backup a PVC
+
+ENVIRONMENT VARIABLES
+
+- constant values - these are super easy to setup
+
+- constant values that do not need to change overtime, but a URLs of sorts. These are HOST variables - these need to be used in other containers.  For those, all we have to do is provide the **name of the ClusterIP Service** as the HOST name. The `name` from the yaml configuration file under `metadata` of the ClusterIP config file.  For example: HOST_NAME=http://redis-cluster-ip-service.  In reality, there is no 'http://' there - that's just an example to make it clear it is the host name.  In practice it is:  `HOST_NAME=redis-cluster-ip-service`
+
+- Things like PGPASSWORD are a little different and slightly harder to setup in order to keep them safe and secure.  We wouldn't want to store its value in plain text in a config file.  We manage these as "secrets" or "secret variables" inside a Kubernetes cluster.
+
+To specify regular non-secret environment variables that are OK to go in clear text in configuration file, we add this section to the definition of a cluster in the configuration file
+```
+env:
+  - name: REDIS_HOST
+    value: redis-cluster-ip-service
+```
+
+The `value` here is the value of the `name` specified in the ClusterIP Service configuration file.
+
+But how to we define a secret like PGPASSWORD? We use a new type of Kubernetes `object` called a `Secret` (like `Pod`, `Deployment`, etc.)
+
+You would use it to securely store one or more pieces of information inside of your cluster:
+
+- db password
+- an API key
+- an SSH key
+- maybe a PGUSER and PGDATABASE could go in here as well
+
+How do we create a `Secret`.  Typically we use a configuration file for each `object` to create it, but not in this case. We run an imperative command to create it. Why? Because we don't want to save the config file with the secret in it ;)
+
+This means that we must create these secrets manually in our local environment, and in the **production** environment as well!
+
+To create a `Secret` imperatively:
+```
+kubectl create secret generic <secret_name> --from-literal key=value
+kubectl create secret generic pgpassword --from-literal PGPASSWORD=12345asdf
+```
+where 
+- `generi` is a type of secret
+- `<secret_name>` is a name of secret for later reference in a pod config
+- `--from-literal` means we are going to add the secret information into this command, as opposed to from a file
+- `key=value` is the Key-value pair of the secret information
+
+You can verify with:
+```
+kubectl get secrets
+```
+
+That shows you the name of the secret and in the DATA column the number of key/value pairs it holds (apparently it can hold multiple?)
+
+The next step is to 
+- configure the deployment file where you want to use this secret, in this case the server-deployment.yaml (so that it can use it to create a connection to the database).
+- configure the postgres-deployment.yaml to tell it what its password should be (override the images default password to use our password when it creates a db)
+
+Note, for the postgres image, the environment variable change recently from PGPASSWORD to POSTGRES_PASSWORD, so it should look like this when configuring it:
+```
+  env:
+    - name: POSTGRES_PASSWORD
+```
+
+Now, to get access to this password, to configure your container's environment variable with the value of one of the KEYs inside that secret:
+```
+env:
+  - name: PGPASSWORD # name of the environment variable
+    valueFrom:
+      secretKeyRef:
+        name: pgpassword # name of the secret itself
+        key: PGPASSWORD
+```
+
+You might experience an error message when applying config files:
+```
+cannot convert int64 to string
+```
+
+This is because ALL environment `value` fields MUST be strings.  You may get this for example when you specify your port values as integers.  Simply enclose those values in single quotes to make them strings instead.
+
+All that's left now is punching a hole in the cluster to expose it to incoming requests - a topic for next section!
+
 ### Handling Traffic with Ingress Controllers
 
 ### Kubernetes Production Deployment
@@ -1017,6 +1185,7 @@ kubectl describe pod client-pod
 To delete/remove and existing object, use the original configuration file that was used to create it when running this command. Note that this is an *imperative* update!
 ```
 kubectl delete -f <config file>
+kubectl delete deployment client-deployment
 ```
 
 To run a `kubectl` command forcing the deployment to use the new image version (imperative command to update an image):
@@ -1042,6 +1211,47 @@ To removed all cached images in minikube Node/VM
 minikube docker-env
 eval $(minikube -p minikube docker-env)
 docker system prune -a
+```
+
+Show all the different options on your computer that Kubernetes has for creating a persistent volume
+```
+kubectl get storageclass
+kubectl describe storageclass
+```
+
+To show all persistent volumes claims (this is the **advertizement** - you can get it if you want to)
+```
+kubectl get pvc
+```
+
+To show all persistent volumes (this is the actual **instance** of storage that meats the advertizement)
+```
+kubectl get pv
+```
+
+To create a `Secret` imperatively:
+```
+kubectl create secret generic <secret_name> --from-literal key=value
+kubectl create secret generic pgpassword --from-literal PGPASSWORD=12345asdf
+```
+where 
+- `generic` is a type of secret (some arbitrary number of key/value pairs together); other options are: `docker-registry` and `tls`
+- `<secret_name>` is a name of secret for later reference in a pod config
+- `--from-literal` means we are going to add the secret information into this command, as opposed to from a file
+- `key=value` is the Key-value pair of the secret information
+
+
+To examine secrets in your cluster:
+```
+kubectl get secrets
+```
+
+
+--- MY OWN ADDITIONS ---------------------------------
+
+To see the Node's memory utilization:
+```
+kube-capacity --util --node-labels agentpool=ml100prod 
 ```
 
 ### Kubernetes on AZURE
